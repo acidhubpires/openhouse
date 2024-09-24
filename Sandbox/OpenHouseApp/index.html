@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenHouse - Pesquisa de Imóveis</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #ffeb3b; /* Fundo amarelo */
+            color: #333;
+        }
+        h3 {
+            color: #d32f2f; /* Vermelho */
+            font-size: 32px; /* Tamanho maior */
+            text-align: center;
+        }
+        #map {
+            height: 600px;
+            width: 100%;
+            margin-top: 10px;
+        }
+        #layer-controls {
+            position: absolute;
+            top: 220px;
+            left: 10px;
+            background-color: rgba(255, 255, 255, 0.9);
+            padding: 10px;
+            border-radius: 5px;
+            z-index: 1000;
+        }
+        #coordinates-display {
+            margin-top: 10px;
+            font-size: 12px;
+        }
+        #download-btn {
+            display: none;
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #333;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <h3>OPENHOUSES</h3>
+
+    <!-- Mapa -->
+    <div id="map"></div>
+
+    <!-- Controles de Camadas e Coordenadas -->
+    <div id="layer-controls">
+        <h4>Camadas</h4>
+        <input type="checkbox" id="toggle-geofence-layer" checked> Geofence<br>
+        <input type="checkbox" id="toggle-poi-layer" checked> POIs Imobiliários
+        <div id="coordinates-display">
+            <p>Coordenadas:</p>
+            <p id="lat-display">Lat: -</p>
+            <p id="lon-display">Lon: -</p>
+        </div>
+        <button id="stop-tracking-btn">Encerrar Pesquisa</button>
+        <button id="download-btn">Baixar GeoJSON</button>
+    </div>
+
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <script>
+        let map, geofenceLayer, poiLayer, geofenceCircle;
+        let poisFound = [];
+        const searchRadius = 6000; // Raio de busca de 5000 metros
+        const geofenceRadius = 100; // Raio da geofence do corretor
+
+        // Inicializa o mapa com a base de imagem de satélite
+        function initMap() {
+            const satelliteLayer = L.tileLayer('http://{s}.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+                maxZoom: 20,
+                subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+                attribution: '&copy; Google Maps'
+            });
+
+            map = L.map('map', {
+                zoom: 15,
+                layers: [satelliteLayer]
+            });
+
+            geofenceLayer = L.layerGroup().addTo(map); // Camada para a Geofence
+            poiLayer = L.layerGroup().addTo(map); // Camada para os POIs
+
+            document.getElementById('toggle-geofence-layer').addEventListener('change', function(e) {
+                if (e.target.checked) {
+                    map.addLayer(geofenceLayer);
+                } else {
+                    map.removeLayer(geofenceLayer);
+                }
+            });
+
+            document.getElementById('toggle-poi-layer').addEventListener('change', function(e) {
+                if (e.target.checked) {
+                    map.addLayer(poiLayer);
+                } else {
+                    map.removeLayer(poiLayer);
+                }
+            });
+
+            document.getElementById('stop-tracking-btn').addEventListener('click', stopTracking);
+
+            // Iniciar a pesquisa
+            startTracking();
+        }
+
+        // Função para capturar a posição inicial do corretor e começar o rastreamento
+        function startTracking() {
+            navigator.geolocation.getCurrentPosition(position => {
+                const lat = position.coords.latitude;
+                const lon = position.coords.longitude;
+
+                // Atualiza as coordenadas no display
+                document.getElementById('lat-display').textContent = `Lat: ${lat.toFixed(5)}`;
+                document.getElementById('lon-display').textContent = `Lon: ${lon.toFixed(5)}`;
+
+                // Centralizar o mapa na posição do corretor e criar a geofence
+                map.setView([lat, lon], 15);
+                createGeofence(lat, lon);
+
+                // Iniciar a busca de POIs
+                fetchPois(lat, lon);
+            });
+        }
+
+        // Função para criar a geofence do corretor
+        function createGeofence(lat, lon) {
+            geofenceCircle = L.circle([lat, lon], {
+                radius: geofenceRadius,
+                color: 'red',
+                fillOpacity: 0.2
+            }).addTo(geofenceLayer);
+        }
+
+        // Função para buscar POIs relacionados ao mercado imobiliário
+        async function fetchPois(lat, lon) {
+            const categories = [
+                'residential', 'apartments', 'commercial', 'real_estate_agent', 'condominium',
+                'supermarket', 'bank', 'parking', 'school', 'hospital', 'cafe', 'restaurant'
+            ];
+            const query = `
+                [out:json];
+                (
+                    ${categories.map(type => `node["building"="${type}"](around:${searchRadius},${lat},${lon});`).join('')}
+                    ${categories.map(type => `way["building"="${type}"](around:${searchRadius},${lat},${lon});`).join('')}
+                    ${categories.map(type => `relation["building"="${type}"](around:${searchRadius},${lat},${lon});`).join('')}
+                );
+                out center;
+            `;
+            const url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
+
+            try {
+                const response = await axios.get(url);
+                const pois = response.data.elements;
+
+                // Limpar camada POIs antes de atualizar
+                poiLayer.clearLayers();
+
+                // Exibir os POIs no mapa
+                pois.forEach(poi => {
+                    const poiLat = poi.lat || poi.center.lat;
+                    const poiLon = poi.lon || poi.center.lon;
+                    const name = poi.tags.name || 'Sem nome';
+                    const type = poi.tags.building || 'Desconhecido';
+
+                    const color = {
+                        residential: 'green',
+                        apartments: 'blue',
+                        commercial: 'yellow',
+                        real_estate_agent: 'purple',
+                        condominium: 'orange',
+                        supermarket: 'cyan',
+                        bank: 'red',
+                        parking: 'brown',
+                        school: 'pink',
+                        hospital: 'darkblue',
+                        cafe: 'lime',
+                        restaurant: 'violet'
+                    }[type] || 'gray';
+
+                    createCircleMarker(poiLat, poiLon, color, name);
+                    poisFound.push(poi);
+                });
+            } catch (error) {
+                console.error('Erro ao buscar POIs:', error);
+            }
+        }
+
+        // Função auxiliar para criar marcadores no mapa
+        function createCircleMarker(lat, lon, color, name) {
+            const marker = L.circleMarker([lat, lon], {
+                radius: 8,
+                fillColor: color,
+                color: color,
+                weight: 1,
+                opacity: 1,
+                fillOpacity: 0.8
+            }).addTo(poiLayer);
+
+            if (name) {
+                marker.bindPopup(`<b>${name}</b>`);
+            }
+
+            marker.on('mouseover', function() {
+                marker.openPopup();
+            });
+        }
+
+        // Função para encerrar a pesquisa
+        function stopTracking() {
+            generateGeoJSON();
+        }
+
+        // Função para gerar o GeoJSON e permitir download
+        function generateGeoJSON() {
+            const geojson = {
+                type: "FeatureCollection",
+                features: poisFound.map(poi => ({
+                    type: "Feature",
+                    geometry: {
+                        type: "Point",
+                        coordinates: [poi.lon || poi.center.lon, poi.lat || poi.center.lat]
+                    },
+                    properties: {
+                        name: poi.tags.name || 'Sem nome',
+                        type: poi.tags.building || 'Desconhecido'
+                    }
+                }))
+            };
+
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(geojson, null, 2));
+            const downloadAnchorNode = document.createElement('a');
+            downloadAnchorNode.setAttribute("href", dataStr);
+            downloadAnchorNode.setAttribute("download", "pois_imobiliarios.geojson");
+
+            // Exibir botão de download
+            const downloadBtn = document.getElementById('download-btn');
+            downloadBtn.style.display = "block";
+            downloadBtn.onclick = () => {
+                downloadAnchorNode.click();
+            };
+        }
+
+        initMap();
+    </script>
+</body>
+</html>
